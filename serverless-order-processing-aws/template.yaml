@@ -1,0 +1,149 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless order processing demo with API Gateway, Lambda, SQS, DynamoDB, and SNS
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 10
+    MemorySize: 128
+
+Resources:
+  OrdersQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: orders-queue
+
+  OrdersTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: orders-topic
+
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: orders-table
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+
+  SubmitOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      InlineCode: |
+        import json
+        import os
+        import uuid
+        import boto3
+
+        sqs = boto3.client("sqs")
+        queue_url = os.environ["QUEUE_URL"]
+
+        def handler(event, context):
+            body = json.loads(event.get("body", "{}"))
+            order_id = str(uuid.uuid4())
+
+            message = {
+                "orderId": order_id,
+                "customer": body.get("customer", "unknown"),
+                "product": body.get("product", "unknown"),
+                "status": "RECEIVED"
+            }
+
+            sqs.send_message(
+                QueueUrl=queue_url,
+                MessageBody=json.dumps(message)
+            )
+
+            return {
+                "statusCode": 200,
+                "body": json.dumps({
+                    "message": "Order received",
+                    "orderId": order_id
+                })
+            }
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref OrdersQueue
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt OrdersQueue.QueueName
+      Events:
+        SubmitOrderApi:
+          Type: Api
+          Properties:
+            Path: /orders
+            Method: post
+
+  ProcessOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      InlineCode: |
+        import json
+        import os
+        import boto3
+
+        dynamodb = boto3.resource("dynamodb")
+        sns = boto3.client("sns")
+
+        table = dynamodb.Table(os.environ["TABLE_NAME"])
+        topic_arn = os.environ["TOPIC_ARN"]
+
+        def handler(event, context):
+            for record in event["Records"]:
+                body = json.loads(record["body"])
+
+                item = {
+                    "orderId": body["orderId"],
+                    "customer": body["customer"],
+                    "product": body["product"],
+                    "status": "PROCESSED"
+                }
+
+                table.put_item(Item=item)
+
+                sns.publish(
+                    TopicArn=topic_arn,
+                    Subject="Order Processed",
+                    Message=json.dumps(item)
+                )
+
+            return {"statusCode": 200}
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref OrdersTable
+          TOPIC_ARN: !Ref OrdersTopic
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt OrdersTopic.TopicName
+      Events:
+        QueueTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OrdersQueue.Arn
+            BatchSize: 1
+
+Outputs:
+  ApiEndpoint:
+    Description: API endpoint for submitting orders
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/orders"
+
+  QueueName:
+    Description: SQS queue name
+    Value: !GetAtt OrdersQueue.QueueName
+
+  TopicArn:
+    Description: SNS topic ARN
+    Value: !Ref OrdersTopic
+
+  TableName:
+    Description: DynamoDB table name
+    Value: !Ref OrdersTable
